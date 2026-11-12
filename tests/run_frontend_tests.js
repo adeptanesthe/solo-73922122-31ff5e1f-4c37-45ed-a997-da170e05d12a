@@ -1,6 +1,7 @@
 /**
  * 门户前端状态机测试：用最小 DOM/窗口桩在 vm 中运行真实的 portal.js，
- * 验证绑定、固定 origin、来源窗口、世代失效与迟到结果丢弃等安全语义。
+ * 验证文档绑定（per-generation nonce）、固定 origin、来源窗口、世代失效、
+ * 旧标识重放拒绝与迟到结果丢弃等安全语义。
  *
  * 运行：node tests/run_frontend_tests.js
  */
@@ -101,7 +102,8 @@ async function boot() {
   const byId = new Map();
   for (const id of [
     'portal-origin', 'vendor-origin', 'device-select', 'delay-input', 'vendor-frame',
-    'frame-status', 'btn-reload', 'btn-load-rogue', 'btn-open-probe', 'requests', 'event-log',
+    'frame-status', 'btn-reload', 'btn-load-rogue', 'btn-load-slow', 'btn-load-replay',
+    'btn-open-probe', 'requests', 'event-log',
   ]) {
     const el = id === 'vendor-frame' ? frame : makeEl(id);
     els[id] = el;
@@ -114,6 +116,7 @@ async function boot() {
   const pendingApproves = [];
   const pendingLogs = [];
   let tokenSeq = 0;
+  let nonceSeq = 0;
 
   async function fakeFetch(url, opts) {
     fetchLog.push({ url, opts });
@@ -140,10 +143,7 @@ async function boot() {
     }
     if (url.endsWith('/api/approve')) {
       return new Promise((resolve) => {
-        pendingApproves.push({
-          resolve,
-          token: `tok-${++tokenSeq}`,
-        });
+        pendingApproves.push({ resolve, token: `tok-${++tokenSeq}` });
       });
     }
     if (url.includes('/api/logs')) {
@@ -161,7 +161,7 @@ async function boot() {
       createElement: () => makeEl('created'),
     },
     fetch: fakeFetch,
-    setInterval: () => 0, // 关闭待确认兜底定时器，由测试显式控制节奏
+    setInterval: () => 0, // 关闭挑战重发/兜底定时器，由测试显式控制节奏
     clearInterval: () => {},
     setTimeout: (fn) => {
       try { fn(); } catch { /* 40s 提示类计时器不影响状态机 */ }
@@ -169,8 +169,13 @@ async function boot() {
     },
     clearTimeout: () => {},
     console,
-    crypto: { randomUUID: () => `uuid-${Math.random().toString(36).slice(2, 10)}` },
-  };
+    crypto: {
+      randomUUID: () => `uuid-${Math.random().toString(36).slice(2, 10)}`,
+      getRandomValues: (arr) => {
+        for (let i = 0; i < arr.length; i += 1) arr[i] = (nonceSeq += 1) % 256;
+        return arr;
+      },
+    },  };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
 
@@ -188,26 +193,47 @@ async function boot() {
 
   const state = vm.runInContext('state', sandbox);
 
-  function hello(sourceWindow, origin, docId, href = '/') {
+  // 模拟一次 iframe 文档加载：门户推进世代、签发新 nonce、投递挑战。
+  // 返回该世代的 nonce（从挑战消息里取），供后续握手/申请使用。
+  function load(sourceWindow) {
+    frame.contentWindow = sourceWindow;
+    frame.src = `${VENDOR_ORIGIN}/some-doc`;
+    frame.dispatch('load', {});
+    const challenge = sourceWindow.posted
+      .filter((p) => p.message.type === 'portal:challenge')
+      .map((p) => p.message)
+      .pop();
+    return challenge;
+  }
+
+  function hello(sourceWindow, origin, nonce, docId, href = '/') {
     win.dispatchMessage({
       origin,
       source: sourceWindow,
-      data: { type: 'vendor:hello', docId, href },
+      data: { type: 'vendor:hello', nonce, docId, href },
     });
   }
 
-  function request(sourceWindow, origin, docId, requestId) {
+  function request(sourceWindow, origin, nonce, docId, requestId) {
     win.dispatchMessage({
       origin,
       source: sourceWindow,
-      data: { type: 'log:request', requestId, docId },
+      data: { type: 'log:request', requestId, nonce, docId },
     });
+  }
+
+  // 完成一次“加载→挑战→握手确认”的标准绑定，返回 { sourceWindow, nonce, docId }。
+  function establish(docId = 'doc-1', sourceWindow = makeSource()) {
+    const challenge = load(sourceWindow);
+    hello(sourceWindow, VENDOR_ORIGIN, challenge.nonce, docId);
+    return { sourceWindow, nonce: challenge.nonce, docId, epoch: challenge.epoch };
   }
 
   return {
     sandbox, state, win, frame, els,
-    fetchLog, pendingApproves, pendingLogs, hello, request,
+    fetchLog, pendingApproves, pendingLogs, load, hello, request, establish,
     flush: () => new Promise((r) => setImmediate(r)),
+    sendChallenge: () => vm.runInContext('sendChallenge()', sandbox),
   };
 }
 
@@ -221,61 +247,57 @@ async function main() {
   {
     const h = await boot();
     const frameWin = makeSource();
-    h.frame.contentWindow = frameWin;
-    h.hello(frameWin, VENDOR_ORIGIN, 'doc-1');
-    check('合法厂商文档完成绑定', h.state.binding?.docId === 'doc-1' && h.state.epoch === 1);
+    const bound = h.establish('doc-1', frameWin);
+    check('合法厂商文档凭 nonce 完成绑定', h.state.binding?.confirmed === true && h.state.epoch === 1);
+    check('门户已投递挑战且 targetOrigin 固定',
+      frameWin.posted.some((p) => p.message.type === 'portal:challenge' && p.targetOrigin === VENDOR_ORIGIN));
 
     // A1 未获准 origin
     const rogueSource = makeSource();
-    h.request(rogueSource, ROGUE_ORIGIN, 'doc-evil', 'req-rogue');
+    h.request(rogueSource, ROGUE_ORIGIN, 'nonce-evil', 'doc-evil', 'req-rogue');
     check('未获准 origin 的申请被拒（不建申请单）', h.state.requests.size === 0);
     check('拒绝原因指向白名单', rogueSource.posted.some((p) => p.message.reason?.includes('白名单')));
 
     // A2 同源旁窗（portal origin）——先死在 origin 白名单
     const portalSource = makeSource();
-    h.request(portalSource, PORTAL_ORIGIN, 'doc-portal', 'req-portal');
+    h.request(portalSource, PORTAL_ORIGIN, bound.nonce, 'doc-portal', 'req-portal');
     check('门户同源旁窗被 origin 白名单拒绝', h.state.requests.size === 0);
 
     // A3 同厂商 origin 但来源窗口不是 iframe
     const sideSource = makeSource();
-    h.request(sideSource, VENDOR_ORIGIN, 'doc-1', 'req-sidewin');
+    h.request(sideSource, VENDOR_ORIGIN, bound.nonce, 'doc-1', 'req-sidewin');
     check('同 origin 旁窗被来源窗口校验拒绝', h.state.requests.size === 0);
     check('拒绝原因指向来源窗口', sideSource.posted.some((p) => p.message.reason?.includes('来源窗口')));
 
-    // A4 iframe 窗口但伪造 docId
-    h.request(frameWin, VENDOR_ORIGIN, 'doc-fake', 'req-fakedoc');
-    check('文档标识不符的申请被拒', h.state.requests.size === 0);
+    // A4 iframe 窗口但 nonce 错误（即使 docId 正确也拒绝）
+    h.request(frameWin, VENDOR_ORIGIN, 'nonce-wrong', 'doc-1', 'req-badnonce');
+    check('nonce 不符的申请被拒（不建单）', !h.state.requests.has('req-badnonce'));
 
     // A5 合法申请建单
-    h.request(frameWin, VENDOR_ORIGIN, 'doc-1', 'req-ok');
-    check('合法申请进入队列且为 pending', h.state.requests.get('req-ok')?.status === 'pending');
+    h.request(frameWin, VENDOR_ORIGIN, bound.nonce, 'doc-1', 'req-ok');
+    const reqOk = h.state.requests.get('req-ok');
+    check('合法申请进入队列且为 pending', reqOk?.status === 'pending');
+    check('申请记录绑定当前 nonce 与世代', reqOk.nonce === bound.nonce && reqOk.epoch === 1);
   }
 
   console.log('[B] 批准-取数-只回传发起文档，且仅一次');
   {
     const h = await boot();
     const frameWin = makeSource();
-    h.frame.contentWindow = frameWin;
-    h.hello(frameWin, VENDOR_ORIGIN, 'doc-1');
-    h.request(frameWin, VENDOR_ORIGIN, 'doc-1', 'req-1');
+    const bound = h.establish('doc-1', frameWin);
+    h.request(frameWin, VENDOR_ORIGIN, bound.nonce, 'doc-1', 'req-1');
 
-    // 触发批准（找到卡片按钮回调）
     const req = h.state.requests.get('req-1');
     vm.runInContext('approveRequest("req-1")', h.sandbox);
     await h.flush();
     check('批准后调用 /api/approve', h.pendingApproves.length === 1);
 
-    // 批准接口返回令牌
-    h.pendingApproves.shift().resolve({
-      ok: true,
-      json: async () => ({ token: 'tok-real' }),
-    });
+    h.pendingApproves.shift().resolve({ ok: true, json: async () => ({ token: 'tok-real' }) });
     await h.flush();
     check('拿到令牌后调用 /api/logs', h.pendingLogs.length === 1);
     check('取数 URL 带一次性令牌与设备', h.pendingLogs[0].url.includes('token=tok-real') &&
       h.pendingLogs[0].url.includes('deviceId=dev-gw-01'));
 
-    // 取数返回
     h.pendingLogs.shift().resolve({
       ok: true,
       json: async () => ({ deviceId: 'dev-gw-01', count: 20, entries: ['line1', 'line2'] }),
@@ -287,7 +309,6 @@ async function main() {
       Boolean(delivery) && delivery.targetOrigin === VENDOR_ORIGIN);
     check('回传 20 条结果', delivery.message.data.count === 20);
 
-    // 再次尝试批准同一申请（按钮虽已消失，但直接调函数也要被拦）
     const before = h.state.epoch;
     vm.runInContext('approveRequest("req-1")', h.sandbox);
     check('重复批准被拦截、世代不变', h.state.epoch === before);
@@ -297,9 +318,8 @@ async function main() {
   {
     const h = await boot();
     const frameWin = makeSource();
-    h.frame.contentWindow = frameWin;
-    h.hello(frameWin, VENDOR_ORIGIN, 'doc-old');
-    h.request(frameWin, VENDOR_ORIGIN, 'doc-old', 'req-late');
+    const bound = h.establish('doc-old', frameWin);
+    h.request(frameWin, VENDOR_ORIGIN, bound.nonce, 'doc-old', 'req-late');
     const oldReq = h.state.requests.get('req-late');
 
     vm.runInContext('approveRequest("req-late")', h.sandbox);
@@ -308,14 +328,17 @@ async function main() {
     await h.flush();
     check('取数在途', h.pendingLogs.length === 1 && oldReq.status === 'approved');
 
-    // iframe 重新加载：新 docId 握手 → 世代推进、旧申请作废
+    // iframe 重新加载：load 即推进世代并签发新 nonce，旧申请作废（不依赖新文档是否握手）
     const frameWin2 = makeSource();
-    h.frame.contentWindow = frameWin2;
-    h.frame.dispatch('load', {});
-    h.hello(frameWin2, VENDOR_ORIGIN, 'doc-new');
-    check('新文档握手后世代推进', h.state.epoch === 2);
-    check('旧申请被标记 invalidated', oldReq.status === 'invalidated');
-    check('当前绑定是新文档', h.state.binding.docId === 'doc-new');
+    const challenge2 = h.load(frameWin2);
+    check('load 后世代立即推进到 2、旧申请作废', h.state.epoch === 2 && oldReq.status === 'invalidated');
+    check('load 后绑定处于未确认且持有新 nonce',
+      h.state.binding.confirmed === false && h.state.binding.nonce === challenge2.nonce);
+    check('新旧 nonce 不同', challenge2.nonce !== bound.nonce);
+
+    // 新文档凭新 nonce 握手确认
+    h.hello(frameWin2, VENDOR_ORIGIN, challenge2.nonce, 'doc-new');
+    check('新文档凭新 nonce 完成绑定', h.state.binding.confirmed === true && h.state.binding.docId === 'doc-new');
 
     // 迟到的取数结果返回：新文档窗口在此期间不应收到任何 log:result
     const postedBefore = frameWin2.posted.filter((p) => p.message.type === 'log:result').length;
@@ -332,22 +355,19 @@ async function main() {
   {
     const h = await boot();
     const frameWin = makeSource();
-    h.frame.contentWindow = frameWin;
-    h.hello(frameWin, VENDOR_ORIGIN, 'doc-a');
-    h.request(frameWin, VENDOR_ORIGIN, 'doc-a', 'req-nav');
+    const bound = h.establish('doc-a', frameWin);
+    h.request(frameWin, VENDOR_ORIGIN, bound.nonce, 'doc-a', 'req-nav');
     const req = h.state.requests.get('req-nav');
 
     vm.runInContext('approveRequest("req-nav")', h.sandbox);
     await h.flush();
     check('批准请求在途', h.pendingApproves.length === 1);
 
-    // 导航换代
+    // 导航换代（load 即生效，无需等待握手）
     const frameWin2 = makeSource();
-    h.frame.contentWindow = frameWin2;
-    h.hello(frameWin2, VENDOR_ORIGIN, 'doc-b');
+    h.load(frameWin2);
     check('导航后世代推进、申请失效', h.state.epoch === 2 && req.status === 'invalidated');
 
-    // 批准接口迟到返回令牌
     h.pendingApproves.shift().resolve({ ok: true, json: async () => ({ token: 'tok-late' }) });
     await h.flush();
     const burnCall = h.fetchLog.find((f) => f.url.includes('/api/logs') && f.url.includes('tok-late'));
@@ -355,67 +375,149 @@ async function main() {
     check('没有任何窗口收到令牌', !h.win.posted.some((p) => JSON.stringify(p).includes('tok-late')));
   }
 
-  console.log('[E] 切换设备：旧设备在途申请失效，绑定文档保留');
+  console.log('[E] 切换设备：旧设备在途申请失效，绑定文档与 nonce 保留');
   {
     const h = await boot();
     const frameWin = makeSource();
-    h.frame.contentWindow = frameWin;
-    h.hello(frameWin, VENDOR_ORIGIN, 'doc-1');
-    h.request(frameWin, VENDOR_ORIGIN, 'doc-1', 'req-dev');
+    const bound = h.establish('doc-1', frameWin);
+    h.request(frameWin, VENDOR_ORIGIN, bound.nonce, 'doc-1', 'req-dev');
     const req = h.state.requests.get('req-dev');
-    const bindingDoc = h.state.binding.docId;
+    const nonceBefore = h.state.binding.nonce;
 
     h.els['device-select'].value = 'dev-pump-02';
     h.els['device-select'].dispatch('change', {});
-    check('切设备推进世代但保留文档绑定', h.state.epoch === 2 && h.state.binding?.docId === bindingDoc);
+    check('切设备推进世代但保留文档绑定与 nonce',
+      h.state.epoch === 2 && h.state.binding?.docId === 'doc-1' && h.state.binding.nonce === nonceBefore);
     check('旧设备申请失效', req.status === 'invalidated');
     check('当前设备已更新', h.state.currentDeviceId === 'dev-pump-02');
 
-    // 新设备的新申请可以正常建单
-    h.request(frameWin, VENDOR_ORIGIN, 'doc-1', 'req-dev2');
+    // 同一文档用同一 nonce 为新设备发起新申请，可以正常建单
+    h.request(frameWin, VENDOR_ORIGIN, bound.nonce, 'doc-1', 'req-dev2');
     const req2 = h.state.requests.get('req-dev2');
     check('新设备申请绑定到新世代与新设备', req2.epoch === 2 && req2.deviceId === 'dev-pump-02');
   }
 
-  console.log('[F] 待确认窗口期：load 后未握手，申请被拒且定时作废');
+  console.log('[F] load 后未握手：不接受任何申请（未确认绑定）');
   {
     const h = await boot();
     const frameWin = makeSource();
-    h.frame.contentWindow = frameWin;
-    h.hello(frameWin, VENDOR_ORIGIN, 'doc-1');
-    h.frame.dispatch('load', {});
-    check('load 后绑定进入待确认', h.state.binding.unconfirmed === true);
+    h.load(frameWin); // 只 load，不回握手
+    check('load 后绑定未确认', h.state.binding.confirmed === false);
 
-    h.request(frameWin, VENDOR_ORIGIN, 'doc-1', 'req-unconf');
-    check('待确认期间的申请被拒', !h.state.requests.has('req-unconf'));
-
-    // 模拟兜底定时器触发（生产代码里是 setInterval 回调）
-    const before = h.state.epoch;
-    vm.runInContext(
-      'if (state.binding && state.binding.unconfirmed) { invalidateRequests("测试兜底：", true); }',
-      h.sandbox,
-    );
-    check('兜底后绑定清空、世代推进', h.state.binding === null && h.state.epoch === before + 1);
+    h.request(frameWin, VENDOR_ORIGIN, h.state.binding.nonce, 'doc-x', 'req-unconf');
+    check('未确认期间即使 nonce 正确也拒绝建单', !h.state.requests.has('req-unconf'));
 
     // 未获准站点 load 后永不握手的场景：消息直接被 origin 拒绝
     h.frame.contentWindow = makeSource();
-    h.request(makeSource(), ROGUE_ORIGIN, 'rogue-doc', 'req-rogue2');
+    h.request(makeSource(), ROGUE_ORIGIN, 'rogue-nonce', 'rogue-doc', 'req-rogue2');
     check('未获准站点消息被固定 origin 拒绝', h.state.requests.size === 0);
   }
 
-  console.log('[G] 握手时序竞争：hello 早于 load 事件也不会误杀绑定');
+  console.log('[G] hello/load 先后顺序与重复握手：正常文档总能完成新申请');
   {
     const h = await boot();
     const frameWin = makeSource();
-    h.frame.contentWindow = frameWin;
-    // 重新加载场景：先到 hello（新 docId），后到 load
-    h.hello(frameWin, VENDOR_ORIGIN, 'doc-2');
-    check('新文档握手即完成绑定', h.state.binding?.docId === 'doc-2');
+
+    // G1 hello 早于 load（新文档尚未收到挑战，拿不到 nonce）：必须拒绝且不推进/不绑定
+    h.hello(frameWin, VENDOR_ORIGIN, '', 'doc-early');
+    check('load 之前的握手（无有效世代/nonce）被拒、无绑定', h.state.binding === null && h.state.epoch === 0);
+
+    // load 推进世代并签发挑战
+    const challenge = h.load(frameWin);
+    check('load 后世代=1、绑定未确认', h.state.epoch === 1 && h.state.binding.confirmed === false);
+
+    // G2 新文档带着正确 nonce 握手 → 确认
+    h.hello(frameWin, VENDOR_ORIGIN, challenge.nonce, 'doc-2');
+    check('正确 nonce 握手确认绑定', h.state.binding.confirmed === true && h.state.epoch === 1);
+
+    // G3 同一文档重复握手（150ms 重发）：幂等，世代不变、不重置任何状态
+    h.hello(frameWin, VENDOR_ORIGIN, challenge.nonce, 'doc-2');
+    check('重复握手幂等、世代仍为 1', h.state.epoch === 1 && h.state.binding.confirmed === true);
+
+    // G4 挑战重发（模拟定时器/消息丢失补偿）后再次握手仍成功
+    h.sendChallenge();
+    h.hello(frameWin, VENDOR_ORIGIN, challenge.nonce, 'doc-2');
+    check('挑战重发后握手依旧成功', h.state.binding.confirmed === true);
+
+    // G5 正常申请在各种握手顺序后仍可建单
+    h.request(frameWin, VENDOR_ORIGIN, challenge.nonce, 'doc-2', 'req-normal');
+    check('正常文档在重复握手后仍能完成新申请', h.state.requests.get('req-normal')?.status === 'pending');
+  }
+
+  console.log('[H] 旧标识重放：复用旧 docId / 重放旧握手 / 旧 nonce 申请全部被拒');
+  {
+    const h = await boot();
+    const oldWin = makeSource();
+    const old = h.establish('doc-original', oldWin);
+    // 旧文档留下一笔等待批准的申请
+    h.request(oldWin, VENDOR_ORIGIN, old.nonce, 'doc-original', 'req-pending');
+    check('旧申请存在且 pending', h.state.requests.get('req-pending')?.status === 'pending');
+
+    // 导航到新文档（同源跳转，窗口代理可能复用，但 nonce 已换）
+    const newWin = makeSource();
+    const newChallenge = h.load(newWin);
+    check('导航即作废旧 pending 申请', h.state.requests.get('req-pending')?.status === 'invalidated');
+
+    // H1 新文档重放旧握手：携带旧 nonce，即使复用完全相同的旧 docId
+    h.hello(newWin, VENDOR_ORIGIN, old.nonce, 'doc-original');
+    check('复用旧 docId + 旧 nonce 的握手被拒、绑定不确认', h.state.binding.confirmed === false);
+    check('旧申请仍是 invalidated，未被恢复', h.state.requests.get('req-pending')?.status === 'invalidated');
+    const replayDenied = newWin.posted.filter((p) => p.message.type === 'log:denied');
+    check('重放握手收到 nonce 不符拒绝', replayDenied.some((p) => String(p.message.reason).includes('nonce')));
+
+    // H2 新文档只发旧 docId、不带 nonce 的握手
+    h.hello(newWin, VENDOR_ORIGIN, '', 'doc-original');
+    check('无 nonce 握手仍被拒、绑定不确认', h.state.binding.confirmed === false);
+
+    // H3 绕过握手，直接用旧 nonce 发申请：不得建单
+    const beforeSize = h.state.requests.size;
+    h.request(newWin, VENDOR_ORIGIN, old.nonce, 'doc-original', 'req-replay');
+    check('旧 nonce 申请不建单', !h.state.requests.has('req-replay') && h.state.requests.size === beforeSize);
+
+    // H4 门户在被重放后补发当前挑战；新文档改用新 nonce 正常握手
+    h.sendChallenge();
+    h.hello(newWin, VENDOR_ORIGIN, newChallenge.nonce, 'doc-original'); // 即便 docId 仍复用旧值
+    check('凭当前新 nonce 握手成功（docId 不再参与信任判定）',
+      h.state.binding.confirmed === true && h.state.binding.nonce === newChallenge.nonce);
+
+    // H5 新文档用新 nonce 发自己的新申请，可正常建单并批准
+    h.request(newWin, VENDOR_ORIGIN, newChallenge.nonce, 'doc-original', 'req-fresh');
+    check('新文档的新申请正常建单', h.state.requests.get('req-fresh')?.status === 'pending');
+  }
+
+  console.log('[I] 慢加载新文档：加载完成前旧申请已作废，完成后凭新 nonce 绑定');
+  {
+    const h = await boot();
+    const oldWin = makeSource();
+    const old = h.establish('doc-before-slow', oldWin);
+    h.request(oldWin, VENDOR_ORIGIN, old.nonce, 'doc-before-slow', 'req-slow');
+
+    // 导航到慢加载页：load 在文档字节到达后才触发；这里先验证“load 一触发即换代”
+    const slowWin = makeSource();
+    const challenge = h.load(slowWin);
+    check('慢加载文档 load 时旧申请立即作废', h.state.requests.get('req-slow')?.status === 'invalidated');
+    check('慢加载期间绑定未确认、挑战已可重发', h.state.binding.confirmed === false);
+
+    // 模拟慢加载期间挑战多次重发（文档脚本尚未运行，无法回应），不影响安全状态
+    h.sendChallenge();
+    h.sendChallenge();
+    check('挑战重发不改变世代、不复活旧申请', h.state.epoch === 2 &&
+      h.state.requests.get('req-slow')?.status === 'invalidated');
+
+    // 文档最终加载完成，带当前 nonce 握手
+    h.hello(slowWin, VENDOR_ORIGIN, challenge.nonce, 'doc-slow');
+    check('慢加载文档完成后正常绑定', h.state.binding.confirmed === true && h.state.binding.docId === 'doc-slow');
+    h.request(slowWin, VENDOR_ORIGIN, challenge.nonce, 'doc-slow', 'req-after-slow');
+    check('慢加载文档可发起属于自己的新申请', h.state.requests.get('req-after-slow')?.status === 'pending');
+  }
+
+  console.log('[J] about:blank 初始 load 不产生世代');
+  {
+    const h = await boot();
+    // 初始 frame.src 为 about:blank，其 load 应被忽略
+    h.frame.src = 'about:blank';
     h.frame.dispatch('load', {});
-    check('随后的 load 仅置待确认，不推进世代', h.state.epoch === 1 && h.state.binding.unconfirmed === true);
-    // hello 重发（厂商页 150ms 重发机制）→ 同 docId 补确认
-    h.hello(frameWin, VENDOR_ORIGIN, 'doc-2');
-    check('同 docId 补确认恢复绑定、世代不变', h.state.binding.unconfirmed === false && h.state.epoch === 1);
+    check('about:blank 的 load 不推进世代、不建绑定', h.state.epoch === 0 && h.state.binding === null);
   }
 
   console.log('\n结果：%d 通过 / %d 失败', pass, fail);

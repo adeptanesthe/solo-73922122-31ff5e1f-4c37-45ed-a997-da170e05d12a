@@ -19,7 +19,9 @@
     <p class="hint" id="bind-status">尚未与门户建立绑定。</p>
     <p>门户选定设备：<b id="device-name">—</b></p>
     <p>门户设定取数延迟：<b id="delay-value">—</b> 秒</p>
-    <p>本文档标识 docId：<code id="doc-id">—</code>（每次加载重新生成并重新绑定）</p>
+    <p>本文档标识 docId：<code id="doc-id">—</code>（每次加载重新生成，仅作展示标签）</p>
+    <p>当前握手 nonce：<code id="nonce-value">—</code>（门户按文档世代签发，导航即失效）</p>
+    <p>当前文档世代 epoch：<code id="epoch-value">—</code></p>
 
     <h2>诊断操作</h2>
     <div class="row">
@@ -30,6 +32,10 @@
       <button id="btn-open-probe" type="button">打开本厂商源旁窗（同源冒充演示）</button>
       <button id="btn-navigate" type="button" class="warn">页内跳转（演示旧申请/迟到结果作废）</button>
     </div>
+    <div class="row">
+      <button id="btn-slow" type="button">打开可控慢加载新文档（slow.html?delay=6）</button>
+      <button id="btn-replay" type="button" class="warn">打开旧标识重放演示页（replay.html）</button>
+    </div>
 
     <h2>通信记录</h2>
     <div id="comm-log" class="event-log"></div>
@@ -37,7 +43,7 @@
     <h2>脱敏日志结果</h2>
     <pre id="log-output" class="log-output">（尚未取得数据）</pre>
   </main>
-
+  <script src="/binding-client.js"></script>
   <script src="/vendor.js"></script>
 </body>
 </html>

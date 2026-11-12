@@ -34,6 +34,7 @@ sys.modules["fastapi"] = fake_pkg
 responses_pkg = types.ModuleType("fastapi.responses")
 responses_pkg.FileResponse = fastapi_stub.FileResponse
 responses_pkg.JSONResponse = fastapi_stub.JSONResponse
+responses_pkg.StreamingResponse = fastapi_stub.StreamingResponse
 sys.modules["fastapi.responses"] = responses_pkg
 fake_pkg.responses = responses_pkg
 
@@ -204,6 +205,29 @@ def test_portal_role():
     check("配置回显角色", cfg["role"] == "portal")
 
 
+def test_slow_route():
+    print("[4] 可控慢加载路由 /slow（仅 vendor 角色）")
+    main = load_main("vendor")
+    # 4.1 vendor 提供 /slow，延迟被钳制，返回 slow.html 内容
+    resp = run(main.slow_page(delay=0))
+    body = run(resp.body())
+    check("vendor /slow 返回 StreamingResponse", hasattr(resp, "body"))
+    check("慢加载页面含演示标识", "慢加载".encode() in body or b"slow" in body)
+    check("慢加载响应禁止缓存", resp.headers.get("Cache-Control") == "no-store")
+    # 超大延迟被钳制到上限且不实际长时间阻塞（delay=99 会被钳到 20，但这里用 0 避免等待）
+    resp2 = run(main.slow_page(delay=-3))
+    check("负延迟被钳制且正常返回", len(run(resp2.body())) > 0)
+
+    # 4.2 portal/rogue 不提供 /slow
+    for role in ("portal", "rogue"):
+        other = load_main(role)
+        try:
+            run(other.slow_page(delay=0))
+            check(f"{role} 关闭 /slow", False, "未抛异常")
+        except HTTPException as exc:
+            check(f"{role} 关闭 /slow", exc.status_code == 404)
+
+
 def test_other_roles():
     print("[4] 厂商/未获准角色：API 全部关闭")
     for role in ("vendor", "rogue"):
@@ -231,6 +255,7 @@ def main_entry():
     test_redaction()
     test_devices()
     test_portal_role()
+    test_slow_route()
     test_other_roles()
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     sys.exit(1 if FAIL else 0)

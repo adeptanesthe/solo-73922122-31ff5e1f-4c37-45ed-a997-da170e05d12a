@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>旧标识重放演示（新文档攻击页）</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>厂商诊断页 · 旧标识重放演示</h1>
+    <div class="origins">
+      <span>本页源 <b id="self-origin">…</b></span>
+      <span>门户源 <b id="portal-origin">…</b></span>
+    </div>
+  </header>
+
+  <main class="panel">
+    <p class="hint">
+      本页模拟“导航后的<b>新文档</b>试图继承旧授权”的攻击：在新文档里手工<b>复用旧 docId、
+      重放旧握手</b>（带回旧 nonce 或不带 nonce）。门户应以“nonce 与当前文档世代不符”拒绝，
+      旧申请保持作废、不恢复绑定；本页只有在收到门户为当前世代签发的新 nonce 并重新握手后，
+      才能发起属于自己的新申请。
+    </p>
+
+    <p>本新文档 docId（页面加载随机生成，与旧文档不同）：<code id="doc-id">—</code></p>
+    <p>门户为当前世代签发的新 nonce（正常握手用）：<code id="good-nonce">尚未收到挑战</code></p>
+    <p>当前世代 epoch：<code id="epoch-value">—</code></p>
+    <p>模拟旧文档遗留标识（手工填写，或用示例值）：</p>
+    <div class="row">
+      <label class="field" style="flex:1">
+        旧 docId
+        <input id="old-docid" type="text" value="vendor-doc-OLD-REPLAYED" />
+      </label>
+      <label class="field" style="flex:1">
+        旧 nonce
+        <input id="old-nonce" type="text" value="nonce-OLD-REPLAYED" />
+      </label>
+    </div>
+
+    <h2>攻击动作（均应被门户拒绝）</h2>
+    <div class="row">
+      <button id="btn-replay-hello-nonce" type="button" class="warn">重放旧握手（带旧 nonce + 旧 docId）</button>
+      <button id="btn-replay-hello-nononce" type="button" class="warn">重放握手（不带 nonce，仅旧 docId）</button>
+    </div>
+    <div class="row">
+      <button id="btn-replay-request" type="button" class="warn">用旧 nonce 直接发日志申请</button>
+      <button id="btn-legit-request" type="button" class="primary">用当前新 nonce 正常握手并发新申请</button>
+    </div>
+
+    <h2>本页实收门户消息（攻击应只见 denied，不见 log:result）</h2>
+    <div id="comm-log" class="event-log"></div>
+    <h2>脱敏日志结果</h2>
+    <pre id="log-output" class="log-output">（尚未取得数据）</pre>
+  </main>
+  <script src="/binding-client.js"></script>
+  <script src="/replay.js"></script>
+</body>
+</html>

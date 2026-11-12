@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>可控慢加载新文档</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>厂商诊断页 · 可控慢加载新文档</h1>
+    <div class="origins">
+      <span>本页源 <b id="self-origin">…</b></span>
+      <span>门户源 <b id="portal-origin">…</b></span>
+    </div>
+  </header>
+
+  <main class="panel">
+    <p class="hint">
+      本页通过 <code>/slow?delay=秒数</code> 在<b>服务端</b>延迟吐出 HTML，模拟“导航后新文档加载很慢”。
+      在文档字节到达前，本页 JS 上下文尚不存在，既无法发握手、也无法继承旧 nonce；
+      而门户在 iframe <code>load</code> 触发的那一刻就已推进世代、作废旧申请并开始重发新 nonce 挑战。
+      文档加载完成后，本页凭收到的<b>当前世代新 nonce</b> 完成握手，旧申请与迟到日志都与本页无关。
+    </p>
+    <p>本页 docId（文档实例化后才生成）：<code id="doc-id">文档尚未加载完成…</code></p>
+    <p>当前握手 nonce：<code id="nonce-value">—</code></p>
+    <p>当前文档世代 epoch：<code id="epoch-value">—</code></p>
+    <p>加载参数：<code id="delay-arg">—</code> 秒</p>
+
+    <div class="row">
+      <label class="field" style="flex:1">
+        重新以延迟（秒）加载本页
+        <input id="delay-input" type="number" min="1" max="20" step="1" value="6" />
+      </label>
+      <button id="btn-reload-slow" type="button">按设定延迟重新慢加载</button>
+      <button id="btn-request" type="button" class="primary">加载完成后申请日志（验证新申请可用）</button>
+    </div>
+
+    <h2>本页实收门户消息（应只含当前世代挑战/确认/本页自己的结果）</h2>
+    <div id="comm-log" class="event-log"></div>
+    <h2>脱敏日志结果</h2>
+    <pre id="log-output" class="log-output">（尚未取得数据）</pre>
+  </main>
+  <script src="/binding-client.js"></script>
+  <script src="/slow.js"></script>
+</body>
+</html>

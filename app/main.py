@@ -20,8 +20,8 @@ import secrets
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,7 @@ VENDOR_ORIGIN = os.getenv("VENDOR_ORIGIN", "http://localhost:8081")
 ROGUE_ORIGIN = os.getenv("ROGUE_ORIGIN", "http://localhost:8082")
 ALLOWED_APPROVER_ORIGINS = {PORTAL_ORIGIN}
 MAX_FETCH_DELAY = 30.0
+MAX_SLOW_DELAY = 20.0
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static" / ROLE
@@ -160,6 +161,27 @@ async def logs(
             "count": len(recent),
             "entries": [redact(line) for line in recent],
         }
+    )
+
+
+# 可控慢加载演示：服务端延迟后才吐出 slow.html，模拟“导航后新文档加载很慢”。
+# 文档字节到达前 iframe 内不存在任何 JS 上下文，门户侧世代已推进、旧申请已作废。
+@app.get("/slow", include_in_schema=False)
+async def slow_page(delay: float = Query(default=0.0)) -> StreamingResponse:
+    if ROLE != "vendor":
+        raise HTTPException(status_code=404, detail="not found")
+    seconds = max(0.0, min(float(delay), MAX_SLOW_DELAY))
+    slow_html = (STATIC_DIR / "slow.html").read_bytes()
+
+    async def generate():  # type: ignore[no-untyped-def]
+        if seconds:
+            await asyncio.sleep(seconds)
+        yield slow_html
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
     )
 
 

@@ -32,6 +32,10 @@
         <button id="btn-reload" type="button">重新加载 iframe（重新绑定文档）</button>
         <button id="btn-load-rogue" type="button" class="warn">载入未获准站点（来源不符演示）</button>
       </div>
+      <div class="row">
+        <button id="btn-load-slow" type="button">载入可控慢加载新文档（slow?delay=6）</button>
+        <button id="btn-load-replay" type="button" class="warn">载入旧标识重放演示页（replay.html）</button>
+      </div>
       <p class="hint" id="frame-status">iframe 尚未绑定文档。</p>
       <iframe id="vendor-frame" title="厂商诊断页" src="about:blank"></iframe>
 
@@ -60,6 +64,8 @@
       <li><b>旁窗冒充：</b>点上方“打开同源旁窗”，在旁窗里发申请 → 事件日志显示因“来源窗口不是已绑定 iframe”被拒。</li>
       <li><b>未获准站点：</b>点“载入未获准站点”，再在该页申请 → 固定 origin 校验拒绝。</li>
       <li><b>跳转后迟到：</b>把延迟调到 8 秒，申请并批准后立刻“重新加载 iframe”或切换设备 → 取数结果回来时发现文档/设备已换代，结果被丢弃，新文档收不到旧数据。</li>
+      <li><b>慢加载新文档：</b>点“载入可控慢加载新文档”，服务端 6 秒后才吐出页面；加载期间旧申请已作废，新文档出生后只凭当前世代新 nonce 握手，事件日志可见挑战重发与 nonce 校验。</li>
+      <li><b>旧标识重放：</b>点“载入旧标识重放演示页”，在新文档里点重放旧握手（旧/缺 nonce）、用旧 nonce 发申请 → 全部以“nonce 与当前世代不符”被拒，旧申请不恢复；再用新 nonce 发新申请可正常成功。</li>
       <li><b>厂商直连接口：</b>在厂商页点“直接 fetch 日志接口” → 无令牌且跨源，请求失败，厂商始终拿不到令牌。</li>
     </ol>
   </section>

@@ -23,6 +23,22 @@ class FileResponse:
         self.headers = {}
 
 
+class StreamingResponse:
+    """最小桩：收集异步迭代器产出的字节，便于测试断言慢加载内容。"""
+
+    def __init__(self, content, status_code=200, media_type=None, headers=None):
+        self._content = content
+        self.status_code = status_code
+        self.media_type = media_type
+        self.headers = dict(headers or {})
+
+    async def body(self):
+        chunks = []
+        async for chunk in self._content:
+            chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+        return b"".join(chunks)
+
+
 class StaticFiles:
     def __init__(self, directory, html=False):
         self.directory = directory
@@ -99,3 +115,12 @@ class Header:
 
 def Header_(default=None):  # noqa: N802
     return Header(default)
+
+
+class QueryInfo:
+    def __init__(self, default=...):
+        self.default = default
+
+
+def Query(default=...):  # noqa: N802
+    return QueryInfo(default)
